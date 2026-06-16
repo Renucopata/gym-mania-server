@@ -1,0 +1,630 @@
+# Phase 1d — Public Lead Capture + Security Hardening + Staff CRM
+
+## Context
+
+Phase 1c is deployed. The backend has staff and member auth, RBAC, and ownership middleware. This phase adds:
+
+- A public `POST /api/leads/contact` endpoint for the landing-page contact form (anonymous, rate-limited, honeypot-protected, room for captcha later).
+- A `contact_submission` table to store leads.
+- Staff CRM endpoints to list, view, and work the leads pipeline (status + assigned-to).
+- `helmet` for security headers (applies globally).
+- `express-rate-limit` for rate limiting (applied to the public lead endpoint specifically).
+- Removal of the legacy role shim from Phase 1c (the transition window has passed).
+- Teardown script updates to handle test members and test contact submissions.
+
+**No frontend work in this phase.** The new frontend will consume these endpoints in a later phase.
+
+## Working agreement — read carefully
+
+- **Do not assume.** Ambiguity = stop and ask.
+- **Do not run migrations.** Generate files; I run them manually.
+- **Do not run `npm install`.** Just update `package.json`; I install.
+- **View files before editing.** Confirm current state — especially `requireRole.js`, `memberAuthController.js`, `scripts/teardown-test-data.js`, and `server.js`.
+- **Step by step, in order.** Pause after each step for "continue".
+- **All migrations have working `down` directions.**
+- **Match existing patterns:** CommonJS, raw pg via shared pool, Zod for new endpoint validation (per the Phase 1c hybrid validation rule).
+
+## High-level decisions already made (do not re-debate)
+
+- Public endpoint: `POST /api/leads/contact`. Anyone can submit.
+- Anti-spam layers: rate limit (5 req/IP/hour) + honeypot field + structure that allows adding captcha later without rewriting.
+- Honeypot field name: `website` (a name spam bots will typically auto-fill, that has no legitimate use for a gym contact form). If the field is non-empty in the submitted body, the request is silently accepted (returns 201) but no row is inserted — confuses bots into not retrying.
+- `contact_submission` schema includes: status (enum: new/contacted/qualified/closed), assigned_to (FK → personal, nullable, ON DELETE SET NULL), source (optional varchar).
+- Lead management endpoints are staff-only (`requireRole(['employee', 'admin'])`).
+- IP-based rate limiting: read real client IP via `x-forwarded-for` (Vercel sets this). The Express app must `app.set('trust proxy', 1)` for the limiter to read it correctly.
+- No deletion endpoint for contact submissions — they're a record. Staff can change status to `closed` instead.
+
+## Step plan
+
+0. Legacy role shim removal + teardown script update
+1. Migration M7 — `contact_submission` table + trigger
+2. Install + configure helmet and express-rate-limit
+3. Public lead capture endpoint
+4. Staff CRM endpoints (list / view / update)
+5. Verification + summary
+
+---
+
+## Step 0 — Cleanup before adding new code
+
+### 0.1 — Remove legacy role shim
+
+The shim was added in Phase 1c to keep pre-Phase-1b JWTs working through their 8h expiry. That window has passed.
+
+**In `middlewares/requireRole.js`:**
+- Delete `LEGACY_ROLE_MAP` constant.
+- Delete the legacy branch inside `normalizeRole()` — the function should just be:
+  ```javascript
+  function normalizeRole(rawRole) {
+    return VALID_ROLES.has(rawRole) ? rawRole : null;
+  }
+  ```
+- Delete the comment block documenting the shim and "when to delete".
+
+**In `controllers/memberAuthController.js`:**
+- In the `me()` handler, remove the inline normalization (`role === 'user' ? 'employee' : role === 'sistemas' ? 'admin' : role`). Just use `req.user.role` directly. Any token with a legacy role value will now correctly fail the role check downstream.
+
+Do a grep for any other occurrence of `LEGACY_ROLE_MAP`, `'user'` -> `'employee'` mapping logic, or `'sistemas'` -> `'admin'` mapping to make sure nothing else is using the shim. If you find any, list them in the step summary before removing.
+
+### 0.2 — Update teardown script
+
+Open `scripts/teardown-test-data.js`. Current behavior: deletes test admin from `personal` and any `turno_trabajo` for them.
+
+Extend it to also delete test member data and test contact submissions, in this order:
+
+```sql
+-- Test contact submissions
+DELETE FROM contact_submission WHERE email = 'test.lead@smashgym.test';
+DELETE FROM contact_submission WHERE email = 'test.member@smashgym.test';
+
+-- Test member (member_auth has ON DELETE CASCADE from cliente, so deleting
+-- cliente will cascade. But explicit is clearer.)
+DELETE FROM member_auth WHERE carnet_identidad = 'TEST_MEM_01';
+DELETE FROM cliente WHERE carnet_identidad = 'TEST_MEM_01';
+
+-- Existing test admin cleanup (unchanged)
+DELETE FROM turno_trabajo WHERE trabajador = 'TEST_ADMIN_01';
+DELETE FROM personal WHERE carnet_identidad = 'TEST_ADMIN_01';
+```
+
+Each step logs row count: `[TEARDOWN] deleted N rows from contact_submission for test emails`, etc.
+
+Keep the safety comment at the top of the file. Identifiers stay hardcoded.
+
+### Acceptance for Step 0
+
+- `LEGACY_ROLE_MAP` and the legacy branch are gone from `requireRole.js`.
+- Inline shim is gone from `memberAuthController.me()`.
+- `scripts/teardown-test-data.js` handles test contact submissions, test member, and test admin in the correct FK order.
+- No other code references the shim.
+
+**STOP. Wait for "continue" before Step 1.**
+
+---
+
+## Step 1 — Migration M7: `contact_submission` table
+
+### Generate the file
+
+`npm run migrate:create -- create-contact-submission-table`
+
+### up SQL
+
+```sql
+CREATE TABLE public.contact_submission (
+  id BIGSERIAL PRIMARY KEY,
+  nombre VARCHAR(100) NOT NULL,
+  email VARCHAR(150) NOT NULL,
+  telefono VARCHAR(20) NULL,
+  mensaje TEXT NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'new',
+  assigned_to VARCHAR(20) NULL
+    REFERENCES public.personal(carnet_identidad) ON DELETE SET NULL,
+  source VARCHAR(50) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT contact_submission_email_format
+    CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
+  CONSTRAINT contact_submission_status_valid
+    CHECK (status IN ('new', 'contacted', 'qualified', 'closed')),
+  CONSTRAINT contact_submission_nombre_length
+    CHECK (LENGTH(TRIM(nombre)) >= 2),
+  CONSTRAINT contact_submission_mensaje_length
+    CHECK (LENGTH(TRIM(mensaje)) >= 10 AND LENGTH(mensaje) <= 2000)
+);
+
+-- Index for listing + filtering by status (common admin query)
+CREATE INDEX contact_submission_status_created_at_idx
+  ON public.contact_submission(status, created_at DESC);
+
+-- Index for "leads assigned to me" queries
+CREATE INDEX contact_submission_assigned_to_idx
+  ON public.contact_submission(assigned_to)
+  WHERE assigned_to IS NOT NULL;
+
+-- Trigger to auto-update updated_at on row update.
+-- Reuse the pattern from member_auth (Phase 1c).
+CREATE OR REPLACE FUNCTION public.touch_contact_submission_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at := CURRENT_TIMESTAMP;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_contact_submission_touch_updated_at
+BEFORE UPDATE ON public.contact_submission
+FOR EACH ROW EXECUTE FUNCTION public.touch_contact_submission_updated_at();
+```
+
+### down SQL
+
+```sql
+DROP TRIGGER IF EXISTS trg_contact_submission_touch_updated_at
+  ON public.contact_submission;
+DROP FUNCTION IF EXISTS public.touch_contact_submission_updated_at();
+DROP INDEX IF EXISTS public.contact_submission_assigned_to_idx;
+DROP INDEX IF EXISTS public.contact_submission_status_created_at_idx;
+DROP TABLE IF EXISTS public.contact_submission;
+```
+
+### Acceptance for Step 1
+
+- Migration file exists with timestamp ordering after M6.
+- Both `up` and `down` are present.
+- Table has FK to `personal` with `ON DELETE SET NULL`.
+- Indexes exist for the two main query patterns.
+- Trigger auto-updates `updated_at`.
+
+**STOP. Wait for "continue" before Step 2.**
+
+---
+
+## Step 2 — Install + configure helmet and express-rate-limit
+
+### Add to `package.json` dependencies
+
+- `helmet` — latest stable v7 or v8
+- `express-rate-limit` — latest stable v7 (if v8 is GA at time of writing, that's also fine)
+
+Do NOT run `npm install`. I run it.
+
+### Configure helmet globally
+
+In `server.js`, add helmet middleware near the top of the middleware stack, BEFORE `cors()` and `express.json()`:
+
+```javascript
+const helmet = require('helmet');
+
+// ... after app is created:
+app.use(helmet());
+```
+
+Default config is fine for an API (no CSP needed since there's no HTML being served). If you find any helmet defaults break existing functionality (unlikely — they're all response headers, no behavior change), flag in the summary.
+
+### Configure trust proxy
+
+For rate limiting to read real client IPs on Vercel, add to `server.js` right after `app` is created:
+
+```javascript
+// Vercel terminates HTTPS and forwards the client IP in x-forwarded-for.
+// Trust the first hop (Vercel's edge). Required for express-rate-limit to
+// correctly identify clients.
+app.set('trust proxy', 1);
+```
+
+### Create the rate limiter
+
+Create `middlewares/rateLimiters.js`:
+
+```javascript
+const rateLimit = require('express-rate-limit');
+
+// Limiter for the public contact-form endpoint.
+// 5 submissions per IP per hour. Returns 429 with a Spanish message.
+const contactFormLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,  // 1 hour
+  max: 5,
+  standardHeaders: true,     // adds RateLimit-* headers
+  legacyHeaders: false,      // omits X-RateLimit-* (deprecated)
+  message: {
+    message: 'Demasiadas solicitudes desde esta dirección. Intente nuevamente más tarde.',
+  },
+});
+
+module.exports = { contactFormLimiter };
+```
+
+### Acceptance for Step 2
+
+- `helmet` and `express-rate-limit` are in `package.json` dependencies (not installed yet).
+- `server.js` uses `helmet()` early in the middleware stack.
+- `server.js` sets `trust proxy` to 1.
+- `middlewares/rateLimiters.js` exists and exports `contactFormLimiter`.
+
+**STOP. Wait for "continue" before Step 3.**
+
+---
+
+## Step 3 — Public lead capture endpoint
+
+### Zod schema
+
+Create `lib/validation/leads.js`:
+
+```javascript
+const { z } = require('zod');
+
+// Note: the `website` field is the honeypot. Bots fill it in; humans don't.
+// We accept it in the schema (to not reject the request outright — bots
+// would get a clear "invalid field" error and adapt) but we'll check its
+// emptiness in the controller.
+const contactSubmissionSchema = z.object({
+  nombre: z.string().trim().min(2).max(100),
+  email: z.string().trim().toLowerCase().email().max(150),
+  telefono: z.string().trim().max(20).optional().or(z.literal('').transform(() => undefined)),
+  mensaje: z.string().trim().min(10).max(2000),
+  source: z.string().trim().max(50).optional(),
+  website: z.string().optional(),  // honeypot — see controller
+});
+
+// Schema for staff updating a lead's status or assignment.
+const updateLeadSchema = z.object({
+  status: z.enum(['new', 'contacted', 'qualified', 'closed']).optional(),
+  assigned_to: z.string().trim().min(5).max(20).nullable().optional(),
+}).refine(
+  data => data.status !== undefined || data.assigned_to !== undefined,
+  { message: 'Debe proporcionar al menos un campo a actualizar.' }
+);
+
+module.exports = { contactSubmissionSchema, updateLeadSchema };
+```
+
+### Model
+
+Create `models/leadsModel.js`:
+
+```javascript
+const pool = require('../config/db');
+
+async function createSubmission({ nombre, email, telefono, mensaje, source }) {
+  const result = await pool.query(
+    `INSERT INTO public.contact_submission
+       (nombre, email, telefono, mensaje, source)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, created_at`,
+    [nombre, email, telefono || null, mensaje, source || null]
+  );
+  return result.rows[0];
+}
+
+async function listSubmissions({ status, assignedTo, limit = 50, offset = 0 }) {
+  // Simple filtered list. Defaults to all leads, most recent first.
+  const conditions = [];
+  const params = [];
+  let p = 1;
+
+  if (status) {
+    conditions.push(`status = $${p++}`);
+    params.push(status);
+  }
+  if (assignedTo === 'unassigned') {
+    conditions.push(`assigned_to IS NULL`);
+  } else if (assignedTo) {
+    conditions.push(`assigned_to = $${p++}`);
+    params.push(assignedTo);
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  params.push(limit, offset);
+
+  const result = await pool.query(
+    `SELECT cs.id, cs.nombre, cs.email, cs.telefono, cs.mensaje,
+            cs.status, cs.assigned_to, cs.source,
+            cs.created_at, cs.updated_at,
+            p.nombre AS assigned_to_nombre, p.apellido AS assigned_to_apellido
+     FROM public.contact_submission cs
+     LEFT JOIN public.personal p ON p.carnet_identidad = cs.assigned_to
+     ${where}
+     ORDER BY cs.created_at DESC
+     LIMIT $${p++} OFFSET $${p++}`,
+    params
+  );
+  return result.rows;
+}
+
+async function findById(id) {
+  const result = await pool.query(
+    `SELECT cs.*, p.nombre AS assigned_to_nombre, p.apellido AS assigned_to_apellido
+     FROM public.contact_submission cs
+     LEFT JOIN public.personal p ON p.carnet_identidad = cs.assigned_to
+     WHERE cs.id = $1`,
+    [id]
+  );
+  return result.rows[0] || null;
+}
+
+// Whitelist-based update — only `status` and `assigned_to` are updatable.
+async function update(id, fields) {
+  const allowed = ['status', 'assigned_to'];
+  const setClauses = [];
+  const params = [];
+  let p = 1;
+
+  for (const key of allowed) {
+    if (key in fields) {
+      setClauses.push(`${key} = $${p++}`);
+      params.push(fields[key]);
+    }
+  }
+
+  if (setClauses.length === 0) {
+    const err = new Error('No valid update fields');
+    err.code = 'INVALID_UPDATE_BODY';
+    throw err;
+  }
+
+  params.push(id);
+  const result = await pool.query(
+    `UPDATE public.contact_submission
+     SET ${setClauses.join(', ')}
+     WHERE id = $${p}
+     RETURNING *`,
+    params
+  );
+  return result.rows[0] || null;
+}
+
+module.exports = { createSubmission, listSubmissions, findById, update };
+```
+
+### Controller
+
+Create `controllers/leadsController.js`:
+
+```javascript
+const Leads = require('../models/leadsModel');
+const { contactSubmissionSchema, updateLeadSchema } = require('../lib/validation/leads');
+
+/**
+ * Public endpoint. Accepts a contact form submission.
+ *
+ * Anti-spam layers:
+ *   1. Rate limiter (middleware): 5/IP/hour
+ *   2. Honeypot: `website` field. If non-empty, the request is silently
+ *      "accepted" (201) but nothing is inserted. This prevents bots from
+ *      detecting they've been caught and rotating their input.
+ *   3. Future: captcha hook. To add captcha later, verify the captcha token
+ *      here BEFORE the honeypot check (so failed captchas get a clear 400,
+ *      and bots that bypass captcha still hit the honeypot).
+ */
+async function submitContact(req, res) {
+  const parsed = contactSubmissionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      message: 'Datos inválidos.',
+      issues: parsed.error.issues.map(i => ({ path: i.path, message: i.message })),
+    });
+  }
+  const data = parsed.data;
+
+  // ---- Captcha hook (future) ----
+  // if (CAPTCHA_ENABLED) {
+  //   const ok = await verifyCaptcha(req.body.captchaToken, req.ip);
+  //   if (!ok) return res.status(400).json({ message: 'Captcha inválido.' });
+  // }
+  // ---- end captcha hook ----
+
+  // Honeypot: if `website` field has content, silently accept without storing.
+  // Logged for monitoring, but no response signal that we caught the bot.
+  if (data.website && data.website.trim().length > 0) {
+    console.warn('[leads] honeypot triggered', {
+      ip: req.ip,
+      website_value_length: data.website.length,
+    });
+    return res.status(201).json({ message: 'Gracias. Nos pondremos en contacto pronto.' });
+  }
+
+  try {
+    const submission = await Leads.createSubmission({
+      nombre: data.nombre,
+      email: data.email,
+      telefono: data.telefono,
+      mensaje: data.mensaje,
+      source: data.source,
+    });
+    return res.status(201).json({
+      message: 'Gracias. Nos pondremos en contacto pronto.',
+      // Note: deliberately not returning submission.id to the public.
+      // Reduces information leakage; staff can find leads via the admin UI.
+    });
+  } catch (err) {
+    console.error('Error en submitContact:', err);
+    // Generic message — don't leak DB error details to anonymous callers.
+    return res.status(500).json({ message: 'Error interno del servidor.' });
+  }
+}
+
+/**
+ * Staff endpoint. List contact submissions, optional filtering.
+ * Query params: status, assigned_to (or 'unassigned'), limit, offset.
+ */
+async function listLeads(req, res) {
+  try {
+    const { status, assigned_to } = req.query;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    // Validate status if provided.
+    if (status && !['new', 'contacted', 'qualified', 'closed'].includes(status)) {
+      return res.status(400).json({ message: 'Status inválido.' });
+    }
+
+    const rows = await Leads.listSubmissions({
+      status,
+      assignedTo: assigned_to,
+      limit,
+      offset,
+    });
+    return res.status(200).json({ data: rows });
+  } catch (err) {
+    console.error('Error en listLeads:', err);
+    return res.status(500).json({ message: 'Error interno del servidor.' });
+  }
+}
+
+/**
+ * Staff endpoint. Get one lead by id.
+ */
+async function getLead(req, res) {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: 'ID inválido.' });
+    }
+    const row = await Leads.findById(id);
+    if (!row) return res.status(404).json({ message: 'Lead no encontrado.' });
+    return res.status(200).json({ data: row });
+  } catch (err) {
+    console.error('Error en getLead:', err);
+    return res.status(500).json({ message: 'Error interno del servidor.' });
+  }
+}
+
+/**
+ * Staff endpoint. Update status and/or assigned_to.
+ */
+async function updateLead(req, res) {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: 'ID inválido.' });
+    }
+
+    const parsed = updateLeadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        message: 'Datos de actualización inválidos.',
+        issues: parsed.error.issues.map(i => ({ path: i.path, message: i.message })),
+      });
+    }
+
+    const updated = await Leads.update(id, parsed.data);
+    if (!updated) return res.status(404).json({ message: 'Lead no encontrado.' });
+    return res.status(200).json({ message: 'Lead actualizado.', data: updated });
+  } catch (err) {
+    if (err.code === 'INVALID_UPDATE_BODY') {
+      return res.status(400).json({ message: 'No hay campos válidos para actualizar.' });
+    }
+    // FK violation on assigned_to (the personal row doesn't exist)
+    if (err.code === '23503') {
+      return res.status(400).json({
+        message: 'El empleado asignado no existe.',
+      });
+    }
+    console.error('Error en updateLead:', err);
+    return res.status(500).json({ message: 'Error interno del servidor.' });
+  }
+}
+
+module.exports = { submitContact, listLeads, getLead, updateLead };
+```
+
+### Routes
+
+Create `routes/leadsRoutes.js`:
+
+```javascript
+const express = require('express');
+const { submitContact, listLeads, getLead, updateLead } = require('../controllers/leadsController');
+const requireRole = require('../middlewares/requireRole');
+const { contactFormLimiter } = require('../middlewares/rateLimiters');
+
+const router = express.Router();
+
+// Public — rate-limited.
+router.post('/contact', contactFormLimiter, submitContact);
+
+// Staff-only — all paths below require employee or admin.
+const staffOnly = requireRole(['employee', 'admin']);
+router.get('/', staffOnly, listLeads);
+router.get('/:id', staffOnly, getLead);
+router.patch('/:id', staffOnly, updateLead);
+
+module.exports = router;
+```
+
+### Mount + public allowlist
+
+In `server.js`:
+- Import: `const leadsRoutes = require('./routes/leadsRoutes');`
+- Mount: `app.use('/api/leads', leadsRoutes);`
+- Update `PUBLIC_ROUTES` to add `/api/leads/contact`. The other lead endpoints stay behind authToken + requireRole.
+
+### Acceptance for Step 3
+
+- `lib/validation/leads.js` exists with both schemas.
+- `models/leadsModel.js` exists with the four functions.
+- `controllers/leadsController.js` exists with the four handlers.
+- `routes/leadsRoutes.js` exists.
+- `server.js` mounts the router and updates `PUBLIC_ROUTES`.
+- Public submit endpoint uses the rate limiter, honeypot, and has a clearly-marked captcha hook for future use.
+- Staff endpoints use `requireRole(['employee', 'admin'])`.
+
+**STOP. Wait for "continue" before Step 4.**
+
+---
+
+## Step 4 — Verification + summary
+
+### Self-check before summary
+
+1. Are the new routes wired correctly? Verify by reading the final `server.js` — confirm `app.use('/api/leads', leadsRoutes)` is mounted and `PUBLIC_ROUTES` includes `/api/leads/contact` and NOT the other lead routes.
+2. Is the rate limiter applied ONLY to the public endpoint? Listing leads as staff should not be rate-limited.
+3. Is helmet applied globally, before route handlers?
+4. Is `app.set('trust proxy', 1)` set?
+5. Does the legacy shim removal leave any orphaned references? Grep for `LEGACY_ROLE_MAP`, `sistemas`, `'user'` outside of test files / migrations / docs.
+6. Is the teardown script's delete order safe (children before parents)?
+
+### Summary contents
+
+1. Files modified — full list with one-line description per file.
+2. Files created — full list.
+3. Exact commands to run, in order:
+   - `npm install`
+   - `npm run migrate:up -- 1` (M7)
+   - Verification queries.
+4. Exact curl smoke tests:
+   - Public contact submit, valid payload → 201
+   - Public contact submit, invalid email → 400
+   - Public contact submit with honeypot filled → 201 (no DB row inserted — verify via psql)
+   - Rate limit kicks in after 5 submissions → 429
+   - Staff lists leads → 200 with array
+   - Staff filters by status → 200
+   - Staff filters by unassigned → 200
+   - Staff updates a lead's status → 200
+   - Staff assigns a lead to themself (their own carnet) → 200
+   - Staff tries to assign to a non-existent carnet → 400
+   - Member tries to list leads → 403
+   - Unauthenticated tries to list leads → 401
+5. Anything noticed but out of scope.
+
+Do not commit. I will review and commit.
+
+## Reminders
+
+- One step at a time. Pause after each.
+- View files before editing.
+- Ask before assuming.
+- No npm install. No running migrations.
+- Working `down` for the migration.
+
+## After this phase
+
+Reminder for the user, not for Claude Code, but include this verbatim in the final summary:
+
+> **OPEN ACTION:** Before deploying the new public-facing frontend, rotate the
+> Neon DB password (exposed in chat history multiple times) and the JWT_SECRET
+> (currently weak: `luz2222`). Do this as a separate small commit — update
+> Vercel env vars, regenerate Neon credentials, redeploy. This invalidates all
+> active JWTs (staff + member), which is intentional.

@@ -1,0 +1,195 @@
+================================================================================
+COMMANDS TO RUN  —  Phase 1d, Step 4 (full role + anti-spam smoke matrix)
+================================================================================
+Run from repo root. Windows PowerShell.
+This file is rewritten each time there are new commands to run.
+
+12 numbered tests cover every case from the spec's Step 4 acceptance list.
+You need TWO PowerShell windows: window 1 keeps `npm run dev` running,
+window 2 runs all the curl tests below.
+================================================================================
+
+# Load DB_URL for the verification + cleanup steps.
+$env:DB_URL = (Get-Content .env | Where-Object { $_ -match '^DB_URL=' }) -replace '^DB_URL=',''
+
+================================================================================
+A) WINDOW 1 — boot (skip if Step 3's dev server is still running)
+================================================================================
+
+npm run dev
+
+================================================================================
+B) WINDOW 2 — set staff + member credentials
+================================================================================
+
+cd C:\Users\ASUS\Documents\Tesis\SmashPlataforma\smash-gym-server
+$env:DB_URL = (Get-Content .env | Where-Object { $_ -match '^DB_URL=' }) -replace '^DB_URL=',''
+
+# REPLACE these two lines with your real staff CI / password (the same
+# TEST_ADMIN_01 you've been using).
+$STAFF_USER = "TEST_ADMIN_01"
+$STAFF_PASS = "TestAdmin123!"
+
+# B1 — staff login → token. We'll reuse $STAFF_TOKEN below.
+$resp = curl.exe -s -X POST http://localhost:3001/api/auth/login `
+  -H "Content-Type: application/json" `
+  -d "{\""user\"":\""$STAFF_USER\"",\""password\"":\""$STAFF_PASS\""}"
+Write-Host $resp
+$STAFF_TOKEN = ($resp | ConvertFrom-Json).token
+Write-Host "STAFF_TOKEN length:" $STAFF_TOKEN.Length
+
+# B2 — register a test member (if TEST_MEM_01 doesn't already exist).
+#       Idempotent-ish: a 409 here is harmless and means the member already
+#       exists from a previous run. Either way you'll log in to get a token.
+$mbody = "{\""carnet_identidad\"":\""TEST_MEM_01\"",\""nombre\"":\""Test\"",\""apellido\"":\""Member\"",\""email\"":\""test.member@smashgym.test\"",\""password\"":\""TestMember!2026\"",\""numero_celular\"":\""70000099\"",\""fecha_nacimiento\"":\""1995-01-15\"",\""genero\"":\""masculino\""}"
+curl.exe -i -X POST http://localhost:3001/api/auth/member/register `
+  -H "Content-Type: application/json" `
+  -d $mbody
+
+# B3 — member login → token.
+$mresp = curl.exe -s -X POST http://localhost:3001/api/auth/member/login `
+  -H "Content-Type: application/json" `
+  -d "{\""email\"":\""test.member@smashgym.test\"",\""password\"":\""TestMember!2026\""}"
+Write-Host $mresp
+$MEMBER_TOKEN = ($mresp | ConvertFrom-Json).token
+Write-Host "MEMBER_TOKEN length:" $MEMBER_TOKEN.Length
+
+================================================================================
+C) SMOKE MATRIX
+================================================================================
+
+# ----------------------------------------------------------------------------
+# 1) Public contact submit, valid payload → 201.
+#    Note: the email is the same one the teardown script removes, on purpose.
+# ----------------------------------------------------------------------------
+$lead_body = "{\""nombre\"":\""Smoke One\"",\""email\"":\""test.lead@smashgym.test\"",\""telefono\"":\""70000001\"",\""mensaje\"":\""I want to learn about your gym plans please.\"",\""source\"":\""landing-smoke\""}"
+
+curl.exe -i -X POST http://localhost:3001/api/leads/contact `
+  -H "Content-Type: application/json" `
+  -d $lead_body
+# Expect: HTTP/1.1 201 + headers RateLimit-Limit:5, RateLimit-Remaining:4
+
+# Capture the lead id we just created. We'll use it for the PATCH tests.
+$LEAD_ID = psql $env:DB_URL -t -A -c "SELECT id FROM contact_submission WHERE email='test.lead@smashgym.test' ORDER BY id DESC LIMIT 1;"
+Write-Host "LEAD_ID:" $LEAD_ID
+
+# ----------------------------------------------------------------------------
+# 2) Public contact submit, invalid email → 400 (Zod).
+# ----------------------------------------------------------------------------
+$bad = "{\""nombre\"":\""Bad Email\"",\""email\"":\""not-an-email\"",\""mensaje\"":\""Message at least ten chars.\""}"
+curl.exe -i -X POST http://localhost:3001/api/leads/contact `
+  -H "Content-Type: application/json" `
+  -d $bad
+# Expect: HTTP/1.1 400 with "issues" array citing email
+
+# ----------------------------------------------------------------------------
+# 3) Public contact submit with the honeypot filled → 201, no DB row.
+# ----------------------------------------------------------------------------
+$honey = "{\""nombre\"":\""Bot Bot\"",\""email\"":\""bot@smashgym.test\"",\""mensaje\"":\""Hello I am a bot please buy my product link link.\"",\""website\"":\""http://spam.example.com\""}"
+curl.exe -i -X POST http://localhost:3001/api/leads/contact `
+  -H "Content-Type: application/json" `
+  -d $honey
+# Expect: HTTP/1.1 201 with the same friendly message.
+
+# Verify NO row was inserted for bot@smashgym.test:
+psql $env:DB_URL -c "SELECT COUNT(*) AS bot_rows FROM contact_submission WHERE email='bot@smashgym.test';"
+# Expect: bot_rows = 0
+
+# ----------------------------------------------------------------------------
+# 4) Rate limit kicks in: 5 OK then the 6th call gets a 429.
+#    (Test 1 was the first; we need 4 more to reach 5, then a 6th to trip it.)
+# ----------------------------------------------------------------------------
+$rl_body = "{\""nombre\"":\""Rate Test\"",\""email\"":\""rate.test@smashgym.test\"",\""mensaje\"":\""Quick rate-limit smoke check message body here.\""}"
+
+# Submissions 2..5 (these should all return 201). 1 was Test #1 above.
+1..4 | ForEach-Object {
+  curl.exe -s -o NUL -w "attempt %{http_code}`n" -X POST http://localhost:3001/api/leads/contact `
+    -H "Content-Type: application/json" -d $rl_body
+}
+
+# Submission 6 — should be 429.
+curl.exe -i -X POST http://localhost:3001/api/leads/contact `
+  -H "Content-Type: application/json" `
+  -d $rl_body
+# Expect: HTTP/1.1 429 with Spanish "Demasiadas solicitudes..." body.
+
+# ----------------------------------------------------------------------------
+# 5) Staff lists all leads → 200 with array.
+# ----------------------------------------------------------------------------
+curl.exe -i -H "Authorization: Bearer $STAFF_TOKEN" http://localhost:3001/api/leads
+# Expect: HTTP/1.1 200 with { "data": [ ... ] } including our seed row.
+
+# ----------------------------------------------------------------------------
+# 6) Staff filters by status → 200.
+# ----------------------------------------------------------------------------
+curl.exe -i -H "Authorization: Bearer $STAFF_TOKEN" "http://localhost:3001/api/leads?status=new"
+# Expect: HTTP/1.1 200 with only status='new' rows.
+
+# ----------------------------------------------------------------------------
+# 7) Staff filters by unassigned → 200.
+# ----------------------------------------------------------------------------
+curl.exe -i -H "Authorization: Bearer $STAFF_TOKEN" "http://localhost:3001/api/leads?assigned_to=unassigned"
+# Expect: HTTP/1.1 200 with only rows where assigned_to IS NULL.
+
+# ----------------------------------------------------------------------------
+# 8) Staff updates a lead's status → 200.
+# ----------------------------------------------------------------------------
+curl.exe -i -X PATCH "http://localhost:3001/api/leads/$LEAD_ID" `
+  -H "Content-Type: application/json" `
+  -H "Authorization: Bearer $STAFF_TOKEN" `
+  -d "{\""status\"":\""contacted\""}"
+# Expect: HTTP/1.1 200 with updated row, updated_at > created_at.
+
+# ----------------------------------------------------------------------------
+# 9) Staff assigns a lead to themself (their own CI) → 200.
+# ----------------------------------------------------------------------------
+curl.exe -i -X PATCH "http://localhost:3001/api/leads/$LEAD_ID" `
+  -H "Content-Type: application/json" `
+  -H "Authorization: Bearer $STAFF_TOKEN" `
+  -d "{\""assigned_to\"":\""$STAFF_USER\""}"
+# Expect: HTTP/1.1 200 with assigned_to = $STAFF_USER.
+
+# ----------------------------------------------------------------------------
+# 10) Staff tries to assign to a non-existent carnet → 400 (FK violation 23503).
+# ----------------------------------------------------------------------------
+curl.exe -i -X PATCH "http://localhost:3001/api/leads/$LEAD_ID" `
+  -H "Content-Type: application/json" `
+  -H "Authorization: Bearer $STAFF_TOKEN" `
+  -d "{\""assigned_to\"":\""DOES_NOT_EXIST\""}"
+# Expect: HTTP/1.1 400 with "El empleado asignado no existe."
+
+# ----------------------------------------------------------------------------
+# 11) Member tries to list leads → 403 (requireRole gate).
+# ----------------------------------------------------------------------------
+curl.exe -i -H "Authorization: Bearer $MEMBER_TOKEN" http://localhost:3001/api/leads
+# Expect: HTTP/1.1 403 "Acceso denegado."
+
+# ----------------------------------------------------------------------------
+# 12) Unauthenticated tries to list leads → 401 (authToken gate, never reaches
+#     requireRole). Distinguishes from test 11 — 401 means "no token", 403
+#     means "wrong role".
+# ----------------------------------------------------------------------------
+curl.exe -i http://localhost:3001/api/leads
+# Expect: HTTP/1.1 401
+
+================================================================================
+D) CLEANUP
+================================================================================
+
+# Easiest: run the updated teardown script. It will remove the test contact
+# rows, TEST_MEM_01, and TEST_ADMIN_01 in FK-safe order.
+node scripts/teardown-test-data.js
+
+# Or, if you want to keep TEST_ADMIN_01 around, delete only the new test data
+# manually:
+# psql $env:DB_URL -c "DELETE FROM contact_submission WHERE email IN ('test.lead@smashgym.test','rate.test@smashgym.test','bot@smashgym.test','test.member@smashgym.test');"
+# psql $env:DB_URL -c "DELETE FROM member_auth WHERE carnet_identidad='TEST_MEM_01';"
+# psql $env:DB_URL -c "DELETE FROM cliente WHERE carnet_identidad='TEST_MEM_01';"
+
+================================================================================
+Phase 1d is functionally complete. Nothing committed by the assistant —
+review the diffs and commit at your discretion. See PHASE_1A_SUMMARY.txt
+for the full per-step breakdown and the noticed/flags list (including the
+DB password + JWT_SECRET rotation reminder before the public landing-page
+frontend goes live).
+================================================================================

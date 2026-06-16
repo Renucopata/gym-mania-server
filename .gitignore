@@ -1,0 +1,10 @@
+# Node modules
+/node_modules/
+
+# Environment variables file
+.env
+smash-schema.sql
+
+# Test seed/teardown scripts (seed contains a plaintext password)
+scripts/seed-test-data.js
+scripts/teardown-test-data.js
