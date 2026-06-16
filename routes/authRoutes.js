@@ -1,5 +1,5 @@
 const express = require("express");
-const { loginUser, registerUser, getEmployees, getOne, getShift, addShift, deleteShift, deleteEmployee } = require("../controllers/authController");
+const { loginUser, registerUser, getEmployees, getOne, getShift, addShift, deleteShift, deleteEmployee, updateEmployeeStatus } = require("../controllers/authController");
 const requireRole = require("../middlewares/requireRole");
 
 const router = express.Router();
@@ -17,6 +17,8 @@ router.post("/login", loginUser);
 
 router.post("/registerUser", adminOnly, registerUser);
 router.post("/addShift", adminOnly, addShift);
+
+router.put("/updateStatus/:ci", adminOnly, updateEmployeeStatus);
 
 router.delete("/remove/:id", adminOnly, deleteShift);
 router.delete("/removeEmployee/:id", adminOnly, deleteEmployee);

@@ -78,6 +78,13 @@ const User = {
     return rows;
   },
 
+  async updateStatus(ci, estado) {
+    const query =
+      "UPDATE personal SET estado = $1 WHERE carnet_identidad = $2 RETURNING carnet_identidad, estado;";
+    const { rows } = await pool.query(query, [estado, ci]);
+    return rows[0];
+  },
+
 
 };
 

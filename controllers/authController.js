@@ -155,6 +155,29 @@ const deleteEmployee = async (req, res) => {
   }
 };
 
+// Toggle an employee's estado between 'activo' and 'inactivo'.
+const updateEmployeeStatus = async (req, res) => {
+  const { ci } = req.params;
+  const { estado } = req.body;
+
+  if (estado !== "activo" && estado !== "inactivo") {
+    return res
+      .status(400)
+      .json({ message: "El estado debe ser 'activo' o 'inactivo'." });
+  }
+
+  try {
+    const updated = await User.updateStatus(ci, estado);
+    if (!updated) {
+      return res.status(404).json({ message: "Empleado no encontrado." });
+    }
+    res.status(200).json({ message: "Estado actualizado exitosamente.", data: updated });
+  } catch (error) {
+    console.error("Error updating employee status:", error);
+    res.status(500).json({ message: "Internal server error" });
+  }
+};
 
 
-module.exports = { loginUser, registerUser, getEmployees, getOne, getShift, addShift, deleteShift, deleteEmployee };
+
+module.exports = { loginUser, registerUser, getEmployees, getOne, getShift, addShift, deleteShift, deleteEmployee, updateEmployeeStatus };
