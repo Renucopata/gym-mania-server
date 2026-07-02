@@ -10,13 +10,19 @@ const Attendance = {
 
   //Retrieve today attendances
   async getDayAttendances() {
+    // The gym operates in America/La_Paz (UTC-4); hora_de_registro is stored
+    // as timestamptz (an absolute instant). Comparing via the session's
+    // default timezone (UTC on Neon) makes "today" roll over ~8pm local time,
+    // silently dropping earlier same-day check-ins from this query. Convert
+    // both sides to the gym's local calendar date explicitly instead.
     const query = `
-        SELECT 
+        SELECT
             a.*,
           CONCAT(c.nombre, ' ', c.apellido) as nombre
         FROM asistencias a
         JOIN cliente c ON a.ci_cliente = c.carnet_identidad
-        WHERE DATE(a.hora_de_registro) = CURRENT_DATE
+        WHERE (a.hora_de_registro AT TIME ZONE 'America/La_Paz')::date =
+              (CURRENT_TIMESTAMP AT TIME ZONE 'America/La_Paz')::date
         ORDER BY a.hora_de_registro DESC;
       `;
     const { rows } = await pool.query(query);

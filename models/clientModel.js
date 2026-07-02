@@ -139,11 +139,50 @@ const Client = {
     return result.rows[0];
   },
 
-  // Delete a client (check for its utility test later)
+  // Delete a client. Membership/attendance history is kept for reports:
+  // before the row is removed, matching subscripcion/asistencias rows are
+  // stamped with a snapshot of the client's carnet_identidad and name, since
+  // the FK will set their reference column to NULL once cliente is gone.
   async remove(ci) {
-    const query = "DELETE FROM cliente WHERE carnet_identidad = $1 RETURNING *;";
-    const { rows } = await pool.query(query, [ci]);
-    return rows[0]?.id;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      await client.query(
+        `UPDATE subscripcion
+            SET cliente_eliminado = true,
+                carnet_identidad_cliente_eliminado = $1,
+                nombre_cliente_eliminado = (
+                  SELECT concat(nombre, ' ', apellido) FROM cliente WHERE carnet_identidad = $1
+                )
+          WHERE carnet_identidad_cliente = $1;`,
+        [ci]
+      );
+
+      await client.query(
+        `UPDATE asistencias
+            SET cliente_eliminado = true,
+                ci_cliente_eliminado = $1,
+                nombre_cliente_eliminado = (
+                  SELECT concat(nombre, ' ', apellido) FROM cliente WHERE carnet_identidad = $1
+                )
+          WHERE ci_cliente = $1;`,
+        [ci]
+      );
+
+      const { rows } = await client.query(
+        "DELETE FROM cliente WHERE carnet_identidad = $1 RETURNING *;",
+        [ci]
+      );
+
+      await client.query("COMMIT");
+      return rows[0];
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   },
 
 };
