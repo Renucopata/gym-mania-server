@@ -35,12 +35,16 @@ const Membership = {
     return rows;
   },
   async getOneById(id) {
+    // LEFT JOIN (not JOIN): if the client was deleted, carnet_identidad_cliente
+    // is NULL and there's no cliente row to match, so an inner join would
+    // silently return zero rows here. Fall back to the snapshot name taken
+    // at delete time in that case.
     const query = `
-    SELECT 
+    SELECT
         s.*,
-        CONCAT(c.nombre, ' ', c.apellido) as nombre_cliente
+        COALESCE(CONCAT(c.nombre, ' ', c.apellido), s.nombre_cliente_eliminado) as nombre_cliente
     FROM subscripcion s
-    JOIN cliente c ON s.carnet_identidad_cliente = c.carnet_identidad 
+    LEFT JOIN cliente c ON s.carnet_identidad_cliente = c.carnet_identidad
     WHERE s.id = $1;
     `;
     const { rows } = await pool.query(query, [id]);
