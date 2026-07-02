@@ -17,12 +17,17 @@ const MEMBERSHIP_UPDATABLE_COLUMNS = [
 
 const Membership = {
   async getAll() {
+    // LEFT JOIN cliente (not JOIN): carnet_identidad_cliente is NULL for
+    // memberships whose client was deleted, so fall back to the snapshot
+    // name taken at delete time in that case.
     const query = `
-      SELECT 
+      SELECT
           s.*,
-          CONCAT(p.nombre, ' ', p.apellido) as inscrito_por_nombre
+          CONCAT(p.nombre, ' ', p.apellido) as inscrito_por_nombre,
+          COALESCE(CONCAT(c.nombre, ' ', c.apellido), s.nombre_cliente_eliminado) as nombre_cliente
       FROM subscripcion s
-      JOIN personal p ON s.inscrito_por = p.carnet_identidad 
+      JOIN personal p ON s.inscrito_por = p.carnet_identidad
+      LEFT JOIN cliente c ON s.carnet_identidad_cliente = c.carnet_identidad
       ORDER BY s.created_at DESC;
     `;
     const { rows } = await pool.query(query);
